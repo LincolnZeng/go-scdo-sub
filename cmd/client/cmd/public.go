@@ -1,0 +1,290 @@
+/**
+*  @file
+*  @copyright defined in go-scdo/LICENSE
+ */
+
+package cmd
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/scdoproject/go-scdo/cmd/util"
+	"github.com/scdoproject/go-scdo/common"
+	"github.com/scdoproject/go-scdo/common/keystore"
+	"github.com/scdoproject/go-scdo/core/types"
+	"github.com/scdoproject/go-scdo/rpc"
+	"github.com/urfave/cli"
+)
+
+type callArgsFactory func(*cli.Context, *rpc.Client) ([]interface{}, error)
+type callResultHandler func(inputs []interface{}, result interface{}) error
+
+func rpcFlags(callArgFlags ...cli.Flag) []cli.Flag {
+	return append([]cli.Flag{addressFlag}, callArgFlags...)
+}
+
+func parseCallArgs(context *cli.Context, client *rpc.Client) ([]interface{}, error) {
+	var args []interface{}
+
+	for _, flag := range context.Command.Flags {
+		if flag == addressFlag || flag == cli.HelpFlag {
+			continue
+		}
+
+		if rf, ok := flag.(rpcFlag); ok {
+			v, err := rf.getValue()
+			if err != nil {
+				return nil, err
+			}
+
+			args = append(args, v)
+		} else {
+			name := flag.GetName()
+			splitName := strings.Split(name, ",")
+
+			var flagValue interface{}
+			for _, n := range splitName {
+				flagName := strings.TrimSpace(n)
+				flagValue = context.Generic(flagName)
+				if flagValue != nil {
+					break
+				}
+			}
+
+			args = append(args, flagValue)
+		}
+	}
+
+	return args, nil
+}
+
+func handleCallResult(inputs []interface{}, result interface{}) error {
+	if result == nil {
+		return nil
+	}
+
+	if str, ok := result.(string); ok {
+		fmt.Println(str)
+		return nil
+	}
+
+	encoded, err := json.MarshalIndent(result, "", "\t")
+	if err != nil {
+		return err
+	}
+
+	fmt.Println(string(encoded))
+
+	return nil
+}
+
+func rpcAction(namespace string, method string) cli.ActionFunc {
+	return rpcActionEx(namespace, method, parseCallArgs, handleCallResult)
+}
+
+func rpcActionEx(namespace string, method string, argsFactory callArgsFactory, resultHandler callResultHandler) cli.ActionFunc {
+	return func(c *cli.Context) error {
+		// Currently, flag is required to specify value.
+		if c.NArg() > 0 {
+			fmt.Printf("flag is not specified for value '%v'\n\n", c.Args().First())
+			return cli.ShowCommandHelp(c, c.Command.Name)
+		}
+
+		if namespace == "miner" {
+			if !strings.HasPrefix(addressValue, "127.0.0.1") && !strings.HasPrefix(addressValue, "localhost") {
+				return fmt.Errorf("miner methods only work for 127.0.0.1 (localhost)")
+			}
+		}
+		client, err := rpc.DialTCP(context.Background(), addressValue)
+		if err != nil {
+			return err
+		}
+
+		args, err := argsFactory(c, client)
+		if err != nil {
+			return err
+		}
+
+		var result interface{}
+		rpcMethod := fmt.Sprintf("%s_%s", namespace, method)
+		if err = client.Call(&result, rpcMethod, args...); err != nil {
+			return fmt.Errorf("Failed to call rpc, %s", err)
+		}
+
+		return resultHandler(args, result)
+	}
+}
+
+func rpcActionSystemContract(namespace string, method string, resultHandler callResultHandler) cli.ActionFunc {
+	return func(c *cli.Context) error {
+		client, err := rpc.DialTCP(context.Background(), addressValue)
+		if err != nil {
+			return err
+		}
+
+		functions, ok := systemContract[namespace]
+		if !ok {
+			return errInvalidCommand
+		}
+
+		function, ok := functions[method]
+		if !ok {
+			return errInvalidSubcommand
+		}
+
+		printdata, arg, err := function(client)
+		if err != nil {
+			return err
+		}
+
+		find := 0
+		if flags, ok := callFlags[namespace]; ok {
+			if _, ok := flags[method]; ok {
+				// use call method to get receipt
+				find = 1
+			}
+		}
+
+		if find == 1 {
+			printdata, err = callTx(client, arg.(*types.Transaction))
+			if err != nil {
+				return err
+			}
+
+		} else {
+			if err := sendTx(client, arg); err != nil {
+				return err
+			}
+		}
+
+		return resultHandler([]interface{}{}, printdata)
+	}
+}
+
+func checkTxCount(client *rpc.Client, txd *types.TransactionData) error {
+	curHeight, err := util.Height(client)
+	if err != nil {
+		return err
+	}
+	lastEpoch := curHeight / common.RelayRange
+	if lastEpoch <= 0 {
+		lastEpoch = 0
+	}
+	height := lastEpoch * common.RelayRange
+
+	lastCountFrom, err := util.GetAccountTxCount(client, txd.From, "", height)
+	if err != nil {
+		return err
+	}
+	curCountFrom, err := util.GetAccountTxCount(client, txd.From, "", curHeight)
+	if err != nil {
+		return err
+	}
+	if curCountFrom-lastCountFrom > common.TxLimitPerRelay {
+		return errors.New("FromAccount transaction count beyond limitation")
+	}
+
+	if txd.To != common.EmptyAddress {
+		lastCountTo, err := util.GetAccountTxCount(client, txd.To, "", height)
+		if err != nil {
+			return err
+		}
+		curCountTo, err := util.GetAccountTxCount(client, txd.To, "", curHeight)
+		if err != nil {
+			return err
+		}
+		if curCountTo-lastCountTo > common.TxLimitPerRelay {
+			return errors.New("ToAccount transaction count beyond limitation")
+		}
+	}
+	return nil
+}
+
+func makeTransaction(context *cli.Context, client *rpc.Client) ([]interface{}, error) {
+	key, txd, err := makeTransactionData(client)
+	if err != nil {
+		return nil, err
+	}
+	err = checkTxCount(client, txd)
+	if err != nil {
+		return nil, err
+	}
+	tx, err := util.GenerateTx(key.PrivateKey, txd.To, txd.Amount, txd.GasPrice, txd.GasLimit, txd.AccountNonce, txd.Payload)
+	if err != nil {
+		return nil, err
+	}
+
+	return []interface{}{*tx}, nil
+}
+
+func makeTransactionData(client *rpc.Client) (*keystore.Key, *types.TransactionData, error) {
+	pass, err := common.GetPassword()
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to get password %s", err)
+	}
+
+	key, err := keystore.GetKey(fromValue, pass)
+	if err != nil {
+		return nil, nil, fmt.Errorf("invalid sender key file. it should be a private key: %s", err)
+	}
+
+	txd, err := checkParameter(&key.PrivateKey.PublicKey, client)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return key, txd, nil
+}
+
+func makeSubTransaction(context *cli.Context, client *rpc.Client) ([]interface{}, error) {
+	key, txd, err := makeTransactionData(client)
+	if err != nil {
+		return nil, err
+	}
+	err = checkTxCount(client, txd)
+	if err != nil {
+		return nil, err
+	}
+	tx, err := util.GenerateSubTx(key.PrivateKey, txd.To, txd.Amount, txd.GasPrice, txd.GasLimit, txd.AccountNonce, txd.Payload, heightValue)
+	if err != nil {
+		return nil, err
+	}
+
+	return []interface{}{*tx}, nil
+}
+
+func onTxAdded(inputs []interface{}, result interface{}) error {
+	if !result.(bool) {
+		fmt.Println("failed to send transaction")
+	}
+
+	tx := inputs[0].(types.Transaction)
+
+	fmt.Println("transaction sent successfully")
+
+	encoded, err := json.MarshalIndent(tx, "", "\t")
+	if err != nil {
+		return err
+	}
+
+	fmt.Println(string(encoded))
+
+	// print corresponding debt if exist
+	debt := types.NewDebtWithoutContext(&tx)
+	if debt != nil {
+		fmt.Println()
+		fmt.Println("It is a cross shard transaction, its debt is:")
+		str, err := json.MarshalIndent(debt, "", "\t")
+		if err != nil {
+			return err
+		}
+
+		fmt.Println(string(str))
+	}
+
+	return nil
+}
